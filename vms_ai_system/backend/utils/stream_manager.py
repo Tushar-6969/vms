@@ -1,115 +1,95 @@
-import threading
 import cv2
-import time
 import os
+import threading
 import json
-from datetime import datetime
-from ai.opencv_detector import detect_objects  # OpenCV detection
-from ai.gemini_utils import summarize_detections  # Gemini summary
-
-MAX_FRAMES = 30  # Total frames to process
-SAVE_EVERY_N = 15  # Only save every 15th frame
-
-class StreamThread(threading.Thread):
-    def __init__(self, stream_id, stream_url):
-        super().__init__()
-        self.stream_id = stream_id
-        self.stream_url = stream_url
-        self.running = True
-
-    def run(self):
-        print(f"[INFO] Starting thread for Stream {self.stream_id} - URL: {self.stream_url}")
-        cap = cv2.VideoCapture(self.stream_url)
-        if not cap.isOpened():
-            print(f"[ERROR] Failed to open stream {self.stream_url}")
-            return
-
-        print(f"[INFO] Stream {self.stream_id} opened successfully.")
-        frame_count = 0
-        all_detections = []
-
-        while self.running:
-            ret, frame = cap.read()
-            if not ret:
-                print(f"[WARN] Stream {self.stream_id} ended or failed.")
-                break
-
-            frame_count += 1
-            print(f"[FRAME] Stream {self.stream_id} - Frame {frame_count} captured")
-
-            if frame_count > MAX_FRAMES:
-                print(f"[INFO] Reached max frame limit ({MAX_FRAMES}). Ending stream {self.stream_id}.")
-                break
-
-            # Step 1: Run detection
-            detection_result, annotated_frame = detect_objects(frame)
-            print(f"[DETECT] Stream {self.stream_id} - Detected {len(detection_result)} objects")
-
-            all_detections.extend(detection_result)
-
-            # Step 2: Save every 15th frame
-            if frame_count % SAVE_EVERY_N == 0:
-                frame_path = f"data/frames/stream_{self.stream_id}_frame_{frame_count}.jpg"
-                os.makedirs(os.path.dirname(frame_path), exist_ok=True)
-                cv2.imwrite(frame_path, annotated_frame)
-                print(f"[SAVE] Frame image saved: {frame_path}")
-
-            time.sleep(0.1)  # ~10 FPS control
-
-        cap.release()
-        print(f"[INFO] Stream {self.stream_id} stopped.")
-
-        # Step 3: Generate ONE Gemini summary after all frames
-        print(f"[GEMINI] Generating final summary for stream {self.stream_id}...")
-        summary = summarize_detections(all_detections, self.stream_id)
-
-        # Step 4: Save final summary to JSON
-        output_data = {
-            "stream_id": self.stream_id,
-            "timestamp": datetime.now().isoformat(),
-            "frame_count": frame_count,
-            "total_detections": len(all_detections),
-            "summary": summary
-        }
-
-        output_path = f"data/outputs/stream_{self.stream_id}.json"
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        try:
-            with open(output_path, "w") as f:
-                json.dump(output_data, f, indent=2)
-            print(f"[SAVE] Final summary JSON saved: {output_path}")
-        except Exception as e:
-            print(f"[ERROR] Failed to write summary JSON: {e}")
-
-
-    def stop(self):
-        self.running = False
-
+from ai.opencv_detector import detect_objects
+# import your Gemini API call if needed:
+# from your_gemini_module import call_gemini_api
 
 class StreamManager:
     def __init__(self):
-        self.streams = {}  # stream_id: thread object
+        self.streams = {}
+        os.makedirs("summaries", exist_ok=True)
+        print("[StreamManager] Initialized. 'summaries' folder ready.")
 
-    def start_stream(self, stream_url):
+    def add_stream(self, url):
         stream_id = len(self.streams) + 1
-        stream_thread = StreamThread(stream_id, stream_url)
-        self.streams[stream_id] = stream_thread
-        stream_thread.start()
-        print(f"[INFO] Started stream {stream_id} with URL: {stream_url}")
+        self.streams[stream_id] = {"url": url, "running": True}
+        print(f"[StreamManager] Adding stream #{stream_id} with URL: {url}")
+        thread = threading.Thread(target=self.process_stream, args=(stream_id, url))
+        thread.start()
         return stream_id
 
     def get_status(self):
-        status = {}
-        for stream_id, thread in self.streams.items():
-            status[stream_id] = {
-                "url": thread.stream_url,
-                "running": thread.is_alive()
-            }
-        return status
+        print("[StreamManager] Current stream status requested.")
+        return self.streams
 
-    def stop_stream(self, stream_id):
-        thread = self.streams.get(stream_id)
-        if thread:
-            thread.stop()
-            return True
-        return False
+    def process_stream(self, stream_id, url):
+        print(f"[StreamManager] Starting processing for Stream #{stream_id} ({url})")
+        cap = cv2.VideoCapture(url)
+        if not cap.isOpened():
+            print(f"[StreamManager] ❌ Failed to open stream #{stream_id}: {url}")
+            self.streams[stream_id]["running"] = False
+            # Always write an error summary
+            summary_file_path = os.path.join("summaries", f"{stream_id}.json")
+            with open(summary_file_path, "w", encoding="utf-8") as f:
+                json.dump({"summary": "Failed to open video stream."}, f, ensure_ascii=False, indent=2)
+            print(f"[StreamManager] Summary saved to {summary_file_path}")
+            return
+
+        detections_log = []
+        frame_count = 0
+        max_frames = 30  # or whatever you want
+        print(f"[StreamManager] Processing up to {max_frames} frames for Stream #{stream_id}")
+        error_message = None
+
+        try:
+            while frame_count < max_frames:
+                ret, frame = cap.read()
+                if not ret:
+                    print(f"[StreamManager] No more frames to read for Stream #{stream_id}.")
+                    break
+
+                try:
+                    detections, _ = detect_objects(frame)
+                except Exception as e:
+                    print(f"[StreamManager] Detection error on frame {frame_count+1}: {e}")
+                    frame_count += 1
+                    continue  # Skip this frame and keep processing
+
+                print(f"[StreamManager] Frame {frame_count+1}: Detected {len(detections)} objects.")
+                if detections:
+                    print(f"[StreamManager] Frame {frame_count+1} Detections: {detections}")
+                    detections_log.extend(detections)
+
+                frame_count += 1
+
+        except Exception as main_ex:
+            error_message = f"Exception for stream {stream_id}: {str(main_ex)}"
+            print(f"[StreamManager] ❌ {error_message}")
+
+        finally:
+            cap.release()
+            self.streams[stream_id]["running"] = False
+
+            if error_message:
+                summary_text = f"❌ Error: {error_message}"
+            elif not detections_log:
+                summary_text = "No faces or relevant objects were detected in the stream."
+                print(f"[StreamManager] No detections found for Stream #{stream_id}.")
+            else:
+                summary_text = f"A total of {len(detections_log)} faces were detected."
+                print(f"[StreamManager] Summary generated for Stream #{stream_id}.")
+
+            # If you want to use Gemini API to summarize, safely add here:
+            # if not error_message and detections_log:
+            #     try:
+            #         summary_text = call_gemini_api(detections_log)
+            #     except Exception as e:
+            #         summary_text = f"❌ Gemini summary error: {str(e)}"
+
+            summary_file_path = os.path.join("summaries", f"{stream_id}.json")
+            with open(summary_file_path, "w", encoding="utf-8") as f:
+                json.dump({"summary": summary_text}, f, ensure_ascii=False, indent=2)
+
+            print(f"[StreamManager] Summary saved to {summary_file_path}")
